@@ -14,7 +14,7 @@ Please follow the instructions from [OpenPCDet](https://github.com/open-mmlab/Op
 # multi-gpu training
 cd tools
 ./dist_train_nus_fp32.sh ./cfgs/qdefmamba_models/qdefmamba_transfusion_nus_v5_M_124_fp32.yaml [other optional arguments]
-
+```
 
 ### Testing
 ```
