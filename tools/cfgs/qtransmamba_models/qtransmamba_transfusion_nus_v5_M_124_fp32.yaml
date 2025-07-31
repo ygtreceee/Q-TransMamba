@@ -1,0 +1,327 @@
+CLASS_NAMES: ['car','truck', 'construction_vehicle', 'bus', 'trailer',
+              'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
+
+DATA_CONFIG:
+  _BASE_CONFIG_: cfgs/dataset_configs/nuscenes_dataset.yaml
+
+  BALANCED_RESAMPLING: False
+
+  POINT_CLOUD_RANGE: [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
+  DATA_AUGMENTOR:
+    DISABLE_AUG_LIST: ['placeholder']
+    AUG_CONFIG_LIST:
+      - NAME: gt_sampling
+        USE_ROAD_PLANE: False
+        DB_INFO_PATH:
+          - nuscenes_dbinfos_10sweeps_withvelo.pkl
+
+        PREPARE: {
+          filter_by_min_points: [
+              'car:5','truck:5', 'construction_vehicle:5', 'bus:5', 'trailer:5',
+              'barrier:5', 'motorcycle:5', 'bicycle:5', 'pedestrian:5', 'traffic_cone:5'
+          ],
+        }
+
+        SAMPLE_GROUPS: [
+          'car:2','truck:3', 'construction_vehicle:7', 'bus:4', 'trailer:6',
+          'barrier:2', 'motorcycle:6', 'bicycle:6', 'pedestrian:2', 'traffic_cone:2'
+        ]
+        NUM_POINT_FEATURES: 5
+        DATABASE_WITH_FAKELIDAR: False
+        REMOVE_EXTRA_WIDTH: [0.0, 0.0, 0.0]
+        LIMIT_WHOLE_SCENE: True
+
+      - NAME: random_world_flip
+        ALONG_AXIS_LIST: ['x', 'y']
+
+      - NAME: random_world_rotation
+        WORLD_ROT_ANGLE: [-0.78539816, 0.78539816]
+
+      - NAME: random_world_scaling
+        WORLD_SCALE_RANGE: [0.9, 1.1]
+
+      - NAME: random_world_translation
+        NOISE_TRANSLATE_STD: [0.5, 0.5, 0.5]
+
+  DATA_PROCESSOR:
+    -   NAME: mask_points_and_boxes_outside_range
+        REMOVE_OUTSIDE_BOXES: True
+        MASK_Z: True
+
+    -   NAME: shuffle_points
+        SHUFFLE_ENABLED: {
+          'train': True,
+          'test': True
+        }
+
+    -   NAME: transform_points_to_voxels_placeholder
+        VOXEL_SIZE: [0.3, 0.3, 0.25]
+
+MODEL:
+    NAME: TransFusion
+
+    VFE:
+        NAME: DynamicVoxelVFE
+        WITH_DISTANCE: False
+        USE_ABSLOTE_XYZ: True
+        USE_NORM: True
+        NUM_FILTERS: [128, 128]
+
+
+    BACKBONE_3D:
+        NAME: QueryDeformableMambav5
+        general_cfg:
+            dim: 128
+
+            ################################################################# Ablation ###########################################################################
+            total_queries: 1300 # [36, 36] \ [22, 22] \ 400 \ 900 (视fj的平均长度定, 一般为其 1/20. 但有可能M版即每个阶段有两次QSSM则需要 900)
+
+            num_stage: [1, 1, 1]
+            sparse_shape: [[[33, 360, 360], [33, 360, 360]], 
+                            [[16, 360, 360], [8, 180, 180], [8, 180, 180], [16, 360, 360]], 
+                            [[7, 360, 360], [2, 90, 90],  [2, 90, 90], [7, 360, 360]]]
+            device: 'cuda'
+            norm_epsilon: 1.0e-5
+
+            ################################################################# Ablation ###########################################################################
+            force_layernorm: False # True则强制将 Backbone3d 中 BN 换成 LN
+
+            ################################################################# Ablation ###########################################################################
+            window_pos_embed: True
+            space_filing_curve: 'z_order' # 'z_order' \ 'hilbert' \ 'random'
+            INPUT_LAYER:
+                # curve_template_3d_rank9: '/home/ygtrece/projects/LION/data/hilbert/curve_template_3d_rank_9.pth'
+                curve_template_3d_rank9: '/raid5/ygtrece/LION/data/hilbert/curve_template_3d_rank_9.pth'
+
+        ffn_cfg:
+            num_ffn_layers: [
+                [[0, 0]], 
+                [[0, 1, 1, 0]], 
+                [[0, 1, 1, 0]]
+            ]
+            ffn_rate: 4
+            residual: True
+            residual_in_fp32: True # NOTE
+
+        qssm_cfg:
+            offset_layer_num: 2
+
+            ################################################################# Ablation ###########################################################################
+            multiscale_modeling: True # 是否启用多尺度建模模块
+            topk_r: 0.12 # 0.2 \ 0.1 \ 0.4(when groups=1)
+            groups: 4 # 4 \ 1(则为正常的固定 topkr)
+            rms_norm: True
+            fused_add_norm: False
+            residual_in_fp32: True # NOTE
+
+            ################################################################# Ablation ###########################################################################
+            mix_type: ['sum', 'sum', 'sum'] # ['mul', 'mul', 'mul'] NOTE: 表示 [上分支反馈类型, 下分支反馈类型, 融合分支融合类型]
+            z_residual: [True, True, True] # NOTE: 表示 [上分支, 下分支, 融合分支]. [False, False, *] when ['mul', 'mul', *]. 默认 [True, True, False]
+            fusion_simulate_z_res: False    # 仅 ['mul', 'mul', *] & [False, False, *] 时可以启用, 添加 SiLU 模仿 SSM 的 z-residual. 默认 False
+            skip_connect: [True, False, True]      # NOTE: 表示 [上分支, 下分支, 下分支残差连接上分支]. 默认 [True, True, False]. 若残差分支为True，建议下分支为False
+
+            query_attn_type: 'base'
+            query_in_fp32: True # NOTE: 强制全精度feedback
+
+            ################################################################# Ablation ###########################################################################
+            query_attn_dropout: 0.0 # NOTE: 可学习向量长期学习可能需要 dropout
+            attn_cfg:
+                num_heads: 4                 # base 方法头数
+
+                ### flash-attn cfg ###
+                flash_num_heads: 4           # 多头注意力 1 \ 4
+                flash_window_size: [-1, -1]  # 滑动窗口大小分布表示左右限制每个q_token对K可见长度 (-1,-1) \ (256,256) \ (128, 128)
+                flash_softcap: 0.0           # 平滑截断系数 0.0 \ 0.2
+                flash_use_alibi: False       # 启用ALiBi位置偏置(搭配多头使用) False \ True
+
+            ################################################################# Ablation ###########################################################################
+            gated_feedback: True
+
+            ################################################################# Ablation ###########################################################################
+            hybrid_gate: False
+            
+        fusion_cfg:
+            fm_down_scale: [1, 1, 2]
+            topk_r: 0.2
+
+        query_ffn_cfg:
+            num_qffn_layers: [
+                [[0, 0]], 
+                [[0, 1, 1, 0]], 
+                [[0, 1, 1, 0]]
+            ]
+
+            ################################################################# Ablation ###########################################################################
+            ffn_type: 'simple' # 'simple' \ 'complex'
+            act_type: 'gelu' # 'relu' \ 'gelu'
+            ffn_rate: 4
+
+            ################################################################# Ablation ###########################################################################
+            dropout: 0.0
+
+            residual: True
+            residual_in_fp32: True # NOTE
+            
+        query_tranformer_cfg:
+            ################################################################# Ablation ###########################################################################
+            wholy_residual: True # NOTE: 代表有残差连接可以完全越过整个 transformer
+            update_rate: 0.0 # NOTE NOTE NOTE: 没问题后可以放开限制！(1.0 表示完全没有 wholy_residual)
+            update_rate_learnable: True # NOTE 以 update_rate 作为初始化值
+
+            ################################################################# Ablation ###########################################################################
+            hybrid_gate: False
+
+            ################################################################# Ablation ###########################################################################
+            num_layers: 1
+            pre_norm: False                  # 建议随模型整体策略
+            residual_in_fp32: True # NOTE
+            
+            attn_type: 'base'
+            dropout: 0.0
+            attn_cfg:
+                num_heads: 4                 # base 方法头数
+
+                flash_num_heads: 4           # 多头注意力 1 \ 4
+                flash_window_size: [-1, -1]  # 滑动窗口大小分布表示左右限制每个q_token对K可见长度 (-1,-1) \ (256,256) \ (128, 128)
+                flash_softcap: 0.0           # 平滑截断系数 0.0 \ 0.2
+                flash_use_alibi: False       # 启用ALiBi位置偏置(搭配多头使用) False \ True
+            ffn_cfg:
+                ffn_rate: 4
+                
+        glssm_cfg:
+            ################################################################# Ablation ###########################################################################
+            ######################### v5-M ########################
+            gssm_kernel_size: [[-1, -1],[-1, 3, -1, 3],[-1, 5, -1, 5]]
+            gssm_stride: [[-1, -1], [-1, 2, -1, 2], [-1, 4, -1, 4]]
+            sub_num: [[-1, -1], [-1, 1, -1, 1], [-1, 1, -1, 1]]
+            rms_norm: True
+            fused_add_norm: False
+            residual_in_fp32: True # NOTE
+            revise_resolution: [[False, False],
+                                [False, True, False, True],
+                                [False, True, False, True]]
+            module_list: [['Bi_GSSM', 'Bi_GSSM'],
+                          ['GSSM', 'QSSM', 'QSSM', 'GSSM'],
+                          ['GSSM', 'QSSM', 'QSSM', 'GSSM']]  # combination of GSSM or QSSM 
+            scan_axis_list: [['x', 'y'],
+                             ['x', ['x', 'x', 'y'], ['y', 'y', 'x'], 'y'],
+                             ['x', ['x', 'x', 'y'], ['y', 'y', 'x'], 'y']]
+            # scan_axis_list: [['x', 'y'],
+            #                  ['x', ['x', 'x', 'x'], ['y', 'y', 'y'], 'y'],
+            #                  ['x', ['x', 'x', 'x'], ['y', 'y', 'y'], 'y']]
+            # scan_axis_list: [['x', 'x'],
+            #                  ['x', ['x', 'x', 'x'], ['x', 'x', 'x'], 'x'],
+            #                  ['x', ['x', 'x', 'x'], ['x', 'x', 'x'], 'x']] # ['x', ['x', 'x', 'y'], ['y', 'y', 'x'], 'y']
+            
+
+ 
+    MAP_TO_BEV:
+        NAME: HeightCompression
+        NUM_BEV_FEATURES: 128 # 256
+
+    BACKBONE_2D:
+        NAME: BaseBEVResBackbone
+        LAYER_NUMS: [ 1, 2, 2 ]
+        LAYER_STRIDES: [ 1, 2, 2 ]
+        NUM_FILTERS: [ 128, 128, 256 ]
+        UPSAMPLE_STRIDES: [ 0.5, 1, 2 ]
+        NUM_UPSAMPLE_FILTERS: [ 128, 128, 128 ]
+
+
+    DENSE_HEAD:
+        CLASS_AGNOSTIC: False
+        NAME: TransFusionHead
+
+        USE_BIAS_BEFORE_NORM: False
+
+        NUM_PROPOSALS: 200
+        HIDDEN_CHANNEL: 128
+        NUM_CLASSES: 10
+        NUM_HEADS: 8
+        NMS_KERNEL_SIZE: 3
+        FFN_CHANNEL: 256
+        DROPOUT: 0
+        BN_MOMENTUM: 0.1
+        ACTIVATION: relu
+
+        NUM_HM_CONV: 2
+        SEPARATE_HEAD_CFG:
+            HEAD_ORDER: [ 'center', 'height', 'dim', 'rot', 'vel' ]
+            HEAD_DICT: {
+                'center': { 'out_channels': 2, 'num_conv': 2 },
+                'height': { 'out_channels': 1, 'num_conv': 2 },
+                'dim': { 'out_channels': 3, 'num_conv': 2 },
+                'rot': { 'out_channels': 2, 'num_conv': 2 },
+                'vel': { 'out_channels': 2, 'num_conv': 2 },
+                'iou': { 'out_channels': 1, 'num_conv': 2 },
+
+            }
+
+        TARGET_ASSIGNER_CONFIG:
+            FEATURE_MAP_STRIDE: 2
+            DATASET: nuScenes
+            GAUSSIAN_OVERLAP: 0.1
+            MIN_RADIUS: 2
+            HUNGARIAN_ASSIGNER:
+                cls_cost: { 'gamma': 2.0, 'alpha': 0.25, 'weight': 0.15 }
+                reg_cost: { 'weight': 0.25 }
+                iou_cost: { 'weight': 0.25 }
+
+        LOSS_CONFIG:
+            LOSS_WEIGHTS: {
+                'cls_weight': 1.0,
+                'bbox_weight': 0.25,
+                'hm_weight': 1.0,
+                'loss_iou_rescore_weight': 0.5,
+                'code_weights': [ 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2 ]
+            }
+            LOSS_CLS:
+                use_sigmoid: True
+                gamma: 2.0
+                alpha: 0.25
+
+        POST_PROCESSING:
+            SCORE_THRESH: 0.0
+            POST_CENTER_RANGE: [ -61.2, -61.2, -10.0, 61.2, 61.2, 10.0 ]
+            USE_IOU_TO_RECTIFY_SCORE: True
+            IOU_RECTIFIER: [ 0.5 ]
+            NMS_CONFIG:
+                NMS_TYPE: nms_gpu
+                NMS_THRESH: 0.2
+                NMS_PRE_MAXSIZE: 1000
+                NMS_POST_MAXSIZE: 100
+                SCORE_THRES: 0.
+
+    POST_PROCESSING:
+        RECALL_THRESH_LIST: [ 0.3, 0.5, 0.7 ]
+        SCORE_THRESH: 0.1
+        OUTPUT_RAW_SCORE: False
+        EVAL_METRIC: kitti
+
+
+OPTIMIZATION:
+    BATCH_SIZE_PER_GPU: 2 #4
+    NUM_EPOCHS: 20 #36
+
+    OPTIMIZER: adam_onecycle
+    LR: 0.004
+    WEIGHT_DECAY: 0.05
+    MOMENTUM: 0.9
+
+    MOMS: [ 0.95, 0.85 ]
+    PCT_START: 0.4
+    DIV_FACTOR: 10
+    DECAY_STEP_LIST: [ 35, 45 ]
+    LR_DECAY: 0.1
+    LR_CLIP: 0.0000001
+
+    LR_WARMUP: False
+    WARMUP_EPOCH: 1
+
+    GRAD_NORM_CLIP: 35
+    LOSS_SCALE_FP16: 4.0
+
+HOOK:
+    DisableAugmentationHook:
+        DISABLE_AUG_LIST: ['gt_sampling']
+        NUM_LAST_EPOCHS: 4
